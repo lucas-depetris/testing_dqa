@@ -50,7 +50,7 @@ def clean_string_column(df, column_name):
     """Clean string columns by trimming whitespace and handling nulls"""
     return df.withColumn(
         column_name,
-        when(col(column_name).isNotNull(), trim(col(column_name)))
+        when(col(column_name).isNotNull() & (trim(col(column_name)) != ''), trim(col(column_name)))
         .otherwise(lit(None))
     )
 
@@ -329,4 +329,4 @@ print("\nProcessed Customers:")
 processed_customers.select("customer_id", "customer_name", "customer_segment", "total_orders", "is_premium").show(5)
 
 print("\nProcessed Delivery Performance:")
-processed_delivery.select("order_id", "delivery_time_minutes", "distance_km", "is_delayed", "delay_category").show(5) 
+processed_delivery.select("order_id", "delivery_time_minutes", "distance_km", "is_delayed", "delay_category").show(5)
