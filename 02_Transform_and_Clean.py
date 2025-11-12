@@ -68,7 +68,7 @@ def clean_phone_number(df, phone_column):
     return df.withColumn(
         phone_column,
         when(col(phone_column).isNotNull(),
-             regexp_replace(col(phone_column), r'[^\d+]', ''))
+             regexp_replace(col(phone_column), r'[^\\d+]', ''))
         .otherwise(lit(None))
     )
 
