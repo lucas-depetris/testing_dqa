@@ -32,6 +32,8 @@ from datetime import datetime
 
 # COMMAND ----------
 
+# Retrieve configuration settings from widgets
+
 dq_agent_catalog_name = dbutils.widgets.get("dq_agent_catalog_name")
 dq_agent_schema_name = dbutils.widgets.get("dq_agent_schema_name")
 dq_agent_raw_schema_name = dbutils.widgets.get("dq_agent_raw_schema_name")
@@ -45,6 +47,8 @@ csv_folder_path = dbutils.widgets.get("csv_folder_path")
 # MAGIC ## Data Cleaning Functions
 
 # COMMAND ----------
+
+# Define functions for cleaning and standardizing data
 
 def clean_string_column(df, column_name):
     """Clean string columns by trimming whitespace and handling nulls"""
@@ -93,6 +97,8 @@ def validate_numeric_range(df, column_name, min_val=None, max_val=None):
 
 # COMMAND ----------
 
+# Process and transform orders data
+
 print("🔄 Processing orders data...")
 
 # Read raw orders data
@@ -137,6 +143,8 @@ print(f"✅ Processed orders: {processed_orders.count()} rows")
 # MAGIC ## Transform Customers Data
 
 # COMMAND ----------
+
+# Process and transform customers data
 
 print("🔄 Processing customers data...")
 
@@ -187,6 +195,8 @@ print(f"✅ Processed customers: {processed_customers.count()} rows")
 # MAGIC ## Transform Delivery Performance Data
 
 # COMMAND ----------
+
+# Process and transform delivery performance data
 
 print("🔄 Processing delivery performance data...")
 
@@ -240,6 +250,8 @@ print(f"✅ Processed delivery performance: {processed_delivery.count()} rows")
 
 # COMMAND ----------
 
+# Save the processed data tables to the specified schema
+
 print("💾 Saving processed tables...")
 
 # Save processed orders
@@ -261,7 +273,8 @@ print(f"✅ Saved processed delivery performance to {dq_agent_catalog_name}.{dq_
 
 # COMMAND ----------
 
-# Generate data quality summary
+# Generate and print a summary of data quality metrics
+
 print("📊 Data Quality Summary:")
 print("=" * 50)
 
@@ -320,7 +333,8 @@ print(f"  - Delay status available: {delivery_quality['delay_status_available']}
 
 # COMMAND ----------
 
-# Show sample processed data
+# Display samples of the processed data for verification
+
 print("📋 Sample Processed Data:")
 print("\nProcessed Orders:")
 processed_orders.select("order_id", "customer_id", "order_total", "delivery_status", "is_on_time", "order_month").show(5)
