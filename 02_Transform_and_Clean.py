@@ -50,7 +50,7 @@ def clean_string_column(df, column_name):
     """Clean string columns by trimming whitespace and handling nulls"""
     return df.withColumn(
         column_name,
-        when(col(column_name).isNotNull(), trim(col(column_name)))
+        when(col(column_name).isNotNull() & trim(col(column_name)) != '', trim(col(column_name)))
         .otherwise(lit(None))
     )
 
