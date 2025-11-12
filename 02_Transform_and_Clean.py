@@ -48,6 +48,7 @@ csv_folder_path = dbutils.widgets.get("csv_folder_path")
 
 def clean_string_column(df, column_name):
     """Clean string columns by trimming whitespace and handling nulls"""
+    print(f'Cleaning column: {column_name}')
     return df.withColumn(
         column_name,
         when(col(column_name).isNotNull(), trim(col(column_name)))
