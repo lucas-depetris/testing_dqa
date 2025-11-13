@@ -143,43 +143,92 @@ print("🔄 Processing customers data...")
 # Read raw customers data
 customers_df = spark.sql(f"SELECT * FROM {dq_agent_catalog_name}.{dq_agent_raw_schema_name}.raw_blinkit_customers")
 
-# Apply transformations
-processed_customers = customers_df \
+# 1) Coerce to string and clean quoting/whitespace artifacts commonly caused by CSV mis-parsing
+str_cols = ["customer_id", "customer_name", "email", "phone", "address", "area"]
+for c in str_cols:
+    customers_df = customers_df.withColumn(c, col(c).cast("string"))
+
+customers_df = (
+    customers_df
+      .withColumn("customer_id", regexp_replace(trim(col("customer_id")), r'(^"|"$)', ''))
+      .withColumn("customer_id", regexp_replace(col("customer_id"), r'\s+', ' '))
+      .withColumn("email", lower(trim(regexp_replace(col("email"), r'(^"|"$)', ''))))
+      .withColumn("customer_name", trim(regexp_replace(col("customer_name"), r'(^"|"$)', '')))
+)
+
+# 2) Detect misalignment using a cities reference and email validity
+city_ref = spark.sql(f"SELECT lower(city_name) AS city_name FROM {dq_agent_catalog_name}.ref.city_list")
+city_ref = broadcast(city_ref)
+
+customers_flagged = (
+    customers_df
+      .join(city_ref, lower(col("customer_name")) == col("city_name"), "left")
+      .withColumn("is_city_in_name", col("city_name").isNotNull())
+      .drop("city_name")
+      .withColumn("is_valid_email", col("email").rlike("^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$"))
+      .withColumn("is_numeric_email", col("email").rlike("^[0-9]+$"))
+      .withColumn("has_city_id_pattern", col("customer_id").rlike('^[A-Za-z ]+[- ]\\d+"?$'))
+      .withColumn("has_trailing_quote", col("customer_id").rlike('"$'))
+      .withColumn("dq_reason",
+                  concat_ws(";",
+                    when(col("is_city_in_name"), lit("CITY_IN_NAME")).otherwise(lit(None)),
+                    when(~col("is_valid_email") | col("is_numeric_email"), lit("INVALID_EMAIL")).otherwise(lit(None)),
+                    when(col("has_city_id_pattern") | col("has_trailing_quote"), lit("MALFORMED_CUSTOMER_ID")).otherwise(lit(None))
+                  )
+      )
+      .withColumn("_processed_timestamp", current_timestamp())
+)
+
+# 3) Split into valid vs quarantine
+valid_customers = customers_flagged.filter(
+    (~col("is_city_in_name")) & col("is_valid_email") & (~col("has_city_id_pattern")) & (~col("has_trailing_quote"))
+)
+
+quarantine_customers = customers_flagged.filter(~((~col("is_city_in_name")) & col("is_valid_email") & (~col("has_city_id_pattern")) & (~col("has_trailing_quote")))) \
+    .withColumn("_quarantined_at", current_timestamp())
+
+# 4) Continue existing standardization on valid records only
+processed_customers = valid_customers \
     .transform(lambda df: clean_string_column(df, "customer_name")) \
     .transform(lambda df: clean_string_column(df, "address")) \
     .transform(lambda df: clean_string_column(df, "area")) \
     .transform(lambda df: standardize_email(df, "email")) \
     .transform(lambda df: clean_phone_number(df, "phone")) \
     .withColumn("registration_date", to_date("registration_date")) \
-    .withColumn("customer_segment", 
-                when(col("customer_segment").isNull(), "Unknown")
-                .otherwise(initcap(col("customer_segment")))) \
-    .withColumn("total_orders", 
-                when(col("total_orders").isNull(), 0)
-                .otherwise(col("total_orders"))) \
-    .withColumn("avg_order_value", 
-                when(col("avg_order_value").isNull(), 0.0)
-                .otherwise(round(col("avg_order_value"), 2))) \
-    .withColumn("_processed_timestamp", current_timestamp()) \
+    .withColumn("customer_segment", when(col("customer_segment").isNull(), "Unknown").otherwise(initcap(col("customer_segment")))) \
+    .withColumn("total_orders", when(col("total_orders").isNull(), 0).otherwise(col("total_orders"))) \
+    .withColumn("avg_order_value", when(col("avg_order_value").isNull(), 0.0).otherwise(round(col("avg_order_value"), 2))) \
     .withColumn("_data_quality_score", lit(1.0))
 
-# Validate numeric ranges
+# 5) Enforce types and ranges; and dedupe valid records (prefer the latest by _processed_timestamp)
 processed_customers = validate_numeric_range(processed_customers, "total_orders", min_val=0)
 processed_customers = validate_numeric_range(processed_customers, "avg_order_value", min_val=0)
 processed_customers = validate_numeric_range(processed_customers, "pincode", min_val=100000, max_val=999999)
 
-# Add derived columns
+w = Window.partitionBy(
+        when(col("email").rlike("@"), lower(col("email"))).otherwise(lit(None)),
+        lower(col("phone")),
+        lower(col("customer_id"))
+    ).orderBy(col("_processed_timestamp").desc())
+processed_customers = processed_customers.withColumn("_rn", row_number().over(w)).filter(col("_rn") == 1).drop("_rn")
+
+# Add derived columns (retain existing business logic)
 processed_customers = processed_customers \
     .withColumn("customer_age_days", 
                 when(col("registration_date").isNotNull(),
-                     datediff(current_date(), col("registration_date")))
-                .otherwise(lit(None))) \
+                     datediff(current_date(), col("registration_date"))
+                ).otherwise(lit(None))) \
     .withColumn("is_premium", 
                 when(col("customer_segment") == "Premium", True)
                 .otherwise(False)) \
     .withColumn("registration_year", year("registration_date"))
 
 print(f"✅ Processed customers: {processed_customers.count()} rows")
+
+# 6) Write quarantine for traceability
+quarantine_customers.select("*", col("dq_reason")).write.mode("overwrite").saveAsTable(
+    f"{dq_agent_catalog_name}.{dq_agent_final_schema_name}.quarantine_blinkit_customers"
+)
 
 # COMMAND ----------
 
@@ -329,4 +378,4 @@ print("\nProcessed Customers:")
 processed_customers.select("customer_id", "customer_name", "customer_segment", "total_orders", "is_premium").show(5)
 
 print("\nProcessed Delivery Performance:")
-processed_delivery.select("order_id", "delivery_time_minutes", "distance_km", "is_delayed", "delay_category").show(5) 
+processed_delivery.select("order_id", "delivery_time_minutes", "distance_km", "is_delayed", "delay_category").show(5)
