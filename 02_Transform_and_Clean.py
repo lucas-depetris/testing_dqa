@@ -141,45 +141,88 @@ print(f"✅ Processed orders: {processed_orders.count()} rows")
 print("🔄 Processing customers data...")
 
 # Read raw customers data
-customers_df = spark.sql(f"SELECT * FROM {dq_agent_catalog_name}.{dq_agent_raw_schema_name}.raw_blinkit_customers")
+customers_df = spark.sql("SELECT * FROM dq_agent_testing.dqa_raw_data.raw_blinkit_customers")
 
-# Apply transformations
-processed_customers = customers_df \
-    .transform(lambda df: clean_string_column(df, "customer_name")) \
-    .transform(lambda df: clean_string_column(df, "address")) \
-    .transform(lambda df: clean_string_column(df, "area")) \
-    .transform(lambda df: standardize_email(df, "email")) \
-    .transform(lambda df: clean_phone_number(df, "phone")) \
-    .withColumn("registration_date", to_date("registration_date")) \
-    .withColumn("customer_segment", 
-                when(col("customer_segment").isNull(), "Unknown")
-                .otherwise(initcap(col("customer_segment")))) \
-    .withColumn("total_orders", 
-                when(col("total_orders").isNull(), 0)
-                .otherwise(col("total_orders"))) \
-    .withColumn("avg_order_value", 
-                when(col("avg_order_value").isNull(), 0.0)
-                .otherwise(round(col("avg_order_value"), 2))) \
-    .withColumn("_processed_timestamp", current_timestamp()) \
-    .withColumn("_data_quality_score", lit(1.0))
+# Known city names observed in mis-mapped customer_name
+city_names = [
+  "delhi","mumbai","jodhpur","haridwar","kalyan-dombivli","ramagundam",
+  "north dumdum","deoghar","vellore","khammam","orai","aligarh","buxar",
+  "nandyal","srinagar","satna","khora","sikar","bharatpur","visakhapatnam",
+  "siliguri","anantapuram"
+]
 
-# Validate numeric ranges
-processed_customers = validate_numeric_range(processed_customers, "total_orders", min_val=0)
-processed_customers = validate_numeric_range(processed_customers, "avg_order_value", min_val=0)
-processed_customers = validate_numeric_range(processed_customers, "pincode", min_val=100000, max_val=999999)
+# Precompute validation flags and cleaned primitives
+customer_id_clean = regexp_replace(trim(col("customer_id")), '"', '')  # strip all double quotes
+bad_id_regex = r'^[A-Za-z][A-Za-z .\-]+[ \-][0-9]{5,6}$'  # City + space/hyphen + 5–6 digits
+is_bad_id = customer_id_clean.rlike(bad_id_regex)
+has_trailing_quote = trim(col("customer_id")).rlike('"$')
 
-# Add derived columns
-processed_customers = processed_customers \
-    .withColumn("customer_age_days", 
-                when(col("registration_date").isNotNull(),
-                     datediff(current_date(), col("registration_date")))
-                .otherwise(lit(None))) \
-    .withColumn("is_premium", 
-                when(col("customer_segment") == "Premium", True)
-                .otherwise(False)) \
-    .withColumn("registration_year", year("registration_date"))
+name_is_city = lower(trim(col("customer_name"))).isin([c.lower() for c in city_names])
 
-print(f"✅ Processed customers: {processed_customers.count()} rows")
+email_clean = lower(trim(col("email")))
+email_valid = email_clean.rlike(r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
+
+phone_digits_only = regexp_replace(col("phone"), r'[^\d]', '')
+phone_looks_date = trim(col("phone")).rlike(r'^\d{4}-\d{2}-\d{2}$')
+phone_valid = (~phone_looks_date) & (length(phone_digits_only).between(10, 15))
+
+# Apply existing standardization plus new repairs/validations
+processed_customers_base = customers_df \
+  .transform(lambda df: clean_string_column(df, "customer_name")) \
+  .transform(lambda df: clean_string_column(df, "address")) \
+  .transform(lambda df: clean_string_column(df, "area")) \
+  .withColumn("registration_date", to_date("registration_date")) \
+  .withColumn("customer_segment", when(col("customer_segment").isNull(), "Unknown").otherwise(initcap(col("customer_segment")))) \
+  .withColumn("total_orders", when(col("total_orders").isNull(), 0).otherwise(col("total_orders"))) \
+  .withColumn("avg_order_value", when(col("avg_order_value").isNull(), 0.0).otherwise(round(col("avg_order_value"), 2))) \
+  .withColumn("_processed_timestamp", current_timestamp()) \
+  .withColumn("_data_quality_score", lit(1.0))
+
+# Repair/clean critical fields and compute invalidity reasons
+processed_customers_cleaned = processed_customers_base \
+  .withColumn("customer_id", when(is_bad_id | has_trailing_quote, lit(None)).otherwise(customer_id_clean)) \
+  .withColumn("customer_name", when(name_is_city, lit(None)).otherwise(trim(col("customer_name")))) \
+  .withColumn("email", when(email_valid, email_clean).otherwise(lit(None))) \
+  .withColumn("phone", when(phone_valid, phone_digits_only).otherwise(lit(None)))
+
+invalid_condition = (
+    col("customer_id").isNull() |
+    name_is_city |
+    (~email_valid) |
+    (~phone_valid)
+)
+
+invalid_customers = processed_customers_cleaned \
+  .where(invalid_condition) \
+  .withColumn("_dq_failure_reason", concat_ws("; ",
+      array_remove(array(
+        when(is_bad_id, lit("customer_id looks like City+PIN")).otherwise(lit(None)),
+        when(has_trailing_quote, lit("customer_id had trailing quote")).otherwise(lit(None)),
+        when(name_is_city, lit("customer_name is city")).otherwise(lit(None)),
+        when(~email_valid, lit("invalid email")).otherwise(lit(None)),
+        when(~phone_valid, lit("invalid phone")).otherwise(lit(None))
+      ), None)
+  ))
+
+valid_customers = processed_customers_cleaned.where(~invalid_condition)
+
+# Validate numeric ranges on valid set only
+valid_customers = validate_numeric_range(valid_customers, "total_orders", min_val=0)
+valid_customers = validate_numeric_range(valid_customers, "avg_order_value", min_val=0)
+valid_customers = validate_numeric_range(valid_customers, "pincode", min_val=100000, max_val=999999)
+
+# Derivations
+valid_customers = valid_customers \
+  .withColumn("customer_age_days", when(col("registration_date").isNotNull(), datediff(current_date(), col("registration_date"))).otherwise(lit(None))) \
+  .withColumn("is_premium", when(col("customer_segment") == "Premium", True).otherwise(False)) \
+  .withColumn("registration_year", year("registration_date"))
+
+# Dedupe by cleaned customer_id to prevent downstream duplication
+valid_customers = valid_customers.dropDuplicates(["customer_id"])
+
+# Persist valid and quarantined sets
+valid_customers.write.mode("overwrite").saveAsTable("dq_agent_testing.dqa_processed_data.processed_blinkit_customers")
+invalid_customers.write.mode("overwrite").saveAsTable("dq_agent_testing.dqa_processed_data.quarantine_blinkit_customers")
 
 # COMMAND ----------
 
@@ -247,8 +290,12 @@ processed_orders.write.mode("overwrite").saveAsTable(f"{dq_agent_catalog_name}.{
 print(f"✅ Saved processed orders to {dq_agent_catalog_name}.{dq_agent_processed_schema_name}.processed_blinkit_orders")
 
 # Save processed customers
-processed_customers.write.mode("overwrite").saveAsTable(f"{dq_agent_catalog_name}.{dq_agent_processed_schema_name}.processed_blinkit_customers")
-print(f"✅ Saved processed customers to {dq_agent_catalog_name}.{dq_agent_processed_schema_name}.processed_blinkit_customers")
+valid_customers.write.mode("overwrite").saveAsTable("dq_agent_testing.dqa_processed_data.processed_blinkit_customers")
+print(f"✅ Saved processed customers to dq_agent_testing.dqa_processed_data.processed_blinkit_customers")
+
+# Save quarantined customers
+invalid_customers.write.mode("overwrite").saveAsTable("dq_agent_testing.dqa_processed_data.quarantine_blinkit_customers")
+print(f"✅ Saved quarantined customers to dq_agent_testing.dqa_processed_data.quarantine_blinkit_customers")
 
 # Save processed delivery performance
 processed_delivery.write.mode("overwrite").saveAsTable(f"{dq_agent_catalog_name}.{dq_agent_processed_schema_name}.processed_blinkit_delivery_performance")
@@ -281,8 +328,8 @@ print(f"  - Valid customer IDs: {orders_quality['non_null_customer_ids']}")
 print(f"  - Valid order totals: {orders_quality['non_null_order_totals']}")
 print(f"  - Delivery status available: {orders_quality['delivery_status_available']}")
 
-# Customers quality metrics
-customers_quality = processed_customers.select(
+# Customers quality metrics (valid set)
+customers_quality = valid_customers.select(
     count("*").alias("total_rows"),
     count("customer_id").alias("non_null_customer_ids"),
     count("email").alias("valid_emails"),
@@ -290,12 +337,19 @@ customers_quality = processed_customers.select(
     count("customer_segment").alias("segments_available")
 ).collect()[0]
 
-print(f"\nCustomers Table:")
+print(f"\nCustomers Table (Valid):")
 print(f"  - Total rows: {customers_quality['total_rows']}")
 print(f"  - Valid customer IDs: {customers_quality['non_null_customer_ids']}")
 print(f"  - Valid emails: {customers_quality['valid_emails']}")
 print(f"  - Valid phones: {customers_quality['valid_phones']}")
 print(f"  - Segments available: {customers_quality['segments_available']}")
+
+# Quarantined customers metrics (invalid set)
+invalid_customers_quality = invalid_customers.select(
+    count("*").alias("total_rows")
+).collect()[0]
+print(f"\nQuarantined Customers:")
+print(f"  - Total rows: {invalid_customers_quality['total_rows']}")
 
 # Delivery quality metrics
 delivery_quality = processed_delivery.select(
@@ -325,8 +379,11 @@ print("📋 Sample Processed Data:")
 print("\nProcessed Orders:")
 processed_orders.select("order_id", "customer_id", "order_total", "delivery_status", "is_on_time", "order_month").show(5)
 
-print("\nProcessed Customers:")
-processed_customers.select("customer_id", "customer_name", "customer_segment", "total_orders", "is_premium").show(5)
+print("\nProcessed Customers (Valid):")
+valid_customers.select("customer_id", "customer_name", "customer_segment", "total_orders", "is_premium").show(5)
+
+print("\nQuarantined Customers (Invalid):")
+invalid_customers.select("customer_id", "customer_name", "email", "phone", "_dq_failure_reason").show(5)
 
 print("\nProcessed Delivery Performance:")
 processed_delivery.select("order_id", "delivery_time_minutes", "distance_km", "is_delayed", "delay_category").show(5) 
