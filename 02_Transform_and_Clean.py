@@ -119,9 +119,13 @@ processed_orders = validate_numeric_range(processed_orders, "store_id", min_val=
 
 # Add derived columns
 processed_orders = processed_orders \
-    .withColumn("delivery_time_minutes", 
+    .withColumn("lateness_minutes", 
                 when(col("actual_delivery_time").isNotNull() & col("promised_delivery_time").isNotNull(),
-                     round((unix_timestamp("actual_delivery_time") - unix_timestamp("promised_delivery_time")) / 60, 2))
+                     round((unix_timestamp("actual_delivery_time") - unix_timestamp("promised_delivery_time")) / 60.0, 2))
+                .otherwise(lit(None))) \
+    .withColumn("delivery_duration_minutes", 
+                when(col("actual_delivery_time").isNotNull() & col("order_date").isNotNull(),
+                     round((unix_timestamp("actual_delivery_time") - unix_timestamp("order_date")) / 60.0, 2))
                 .otherwise(lit(None))) \
     .withColumn("is_on_time", 
                 when(col("delivery_status") == "On Time", True)
@@ -193,43 +197,65 @@ print("🔄 Processing delivery performance data...")
 # Read raw delivery performance data
 delivery_df = spark.sql(f"SELECT * FROM {dq_agent_catalog_name}.{dq_agent_raw_schema_name}.raw_blinkit_delivery_performance")
 
-# Apply transformations
-processed_delivery = delivery_df \
-    .withColumn("promised_time", to_timestamp("promised_time")) \
-    .withColumn("actual_time", to_timestamp("actual_time")) \
-    .withColumn("delivery_time_minutes", 
-                when(col("delivery_time_minutes").isNotNull(), round(col("delivery_time_minutes"), 2))
-                .otherwise(lit(None))) \
-    .withColumn("distance_km", 
-                when(col("distance_km").isNotNull(), round(col("distance_km"), 2))
-                .otherwise(lit(None))) \
-    .withColumn("delivery_status", 
-                when(col("delivery_status").isNull(), "Unknown")
-                .otherwise(initcap(col("delivery_status")))) \
-    .withColumn("reasons_if_delayed", 
-                when(col("reasons_if_delayed").isNull(), "None")
-                .otherwise(trim(col("reasons_if_delayed")))) \
-    .withColumn("_processed_timestamp", current_timestamp()) \
-    .withColumn("_data_quality_score", lit(1.0))
+# Bring in the order creation timestamp for duration calculation
+orders_for_join = processed_orders.select(
+    col("order_id").alias("order_id"),
+    col("order_date").alias("order_created_time")
+)
 
-# Validate numeric ranges
-processed_delivery = validate_numeric_range(processed_delivery, "delivery_time_minutes", min_val=-60, max_val=300)
+# Apply transformations
+processed_delivery = (
+    delivery_df.alias("d")
+    .withColumn("promised_time", to_timestamp("promised_time"))
+    .withColumn("actual_time", to_timestamp("actual_time"))
+    .join(orders_for_join, on="order_id", how="left")
+    # Compute true delivery duration from order creation to actual delivery
+    .withColumn(
+        "delivery_duration_minutes_raw",
+        when(col("actual_time").isNotNull() & col("order_created_time").isNotNull(),
+             (unix_timestamp(col("actual_time")) - unix_timestamp(col("order_created_time"))) / 60.0)
+    )
+    # Enforce physical realism: duration must be > 0
+    .withColumn(
+        "delivery_time_minutes",
+        when(col("delivery_duration_minutes_raw") > 0, round(col("delivery_duration_minutes_raw"), 2))
+        .otherwise(lit(None))
+    )
+    # Compute lateness/earliness vs promise in a separate field
+    .withColumn(
+        "lateness_minutes",
+        when(col("actual_time").isNotNull() & col("promised_time").isNotNull(),
+             round((unix_timestamp(col("actual_time")) - unix_timestamp(col("promised_time"))) / 60.0, 2))
+        .otherwise(lit(None))
+    )
+    .withColumn("distance_km", when(col("distance_km").isNotNull(), round(col("distance_km"), 2)).otherwise(lit(None)))
+    .withColumn("delivery_status", when(col("delivery_status").isNull(), "Unknown").otherwise(initcap(col("delivery_status"))))
+    .withColumn("reasons_if_delayed", when(col("reasons_if_delayed").isNull(), "None").otherwise(trim(col("reasons_if_delayed"))))
+    .withColumn("_processed_timestamp", current_timestamp())
+    .withColumn("_data_quality_score", lit(1.0))
+)
+
+# Validate ranges: duration must be 1..300, lateness can be negative for early deliveries
+processed_delivery = validate_numeric_range(processed_delivery, "delivery_time_minutes", min_val=1, max_val=300)
+processed_delivery = validate_numeric_range(processed_delivery, "lateness_minutes", min_val=-120, max_val=240)
 processed_delivery = validate_numeric_range(processed_delivery, "distance_km", min_val=0, max_val=50)
 
-# Add derived columns
+# Derive flags from lateness (not duration)
 processed_delivery = processed_delivery \
-    .withColumn("is_delayed", 
-                when(col("delivery_time_minutes") > 0, True)
-                .otherwise(False)) \
-    .withColumn("delay_category", 
-                when(col("delivery_time_minutes") <= 0, "On Time")
-                .when(col("delivery_time_minutes") <= 5, "Slight Delay")
-                .when(col("delivery_time_minutes") <= 15, "Moderate Delay")
-                .otherwise("Significant Delay")) \
-    .withColumn("delivery_efficiency", 
-                when(col("distance_km") > 0,
-                     round(col("delivery_time_minutes") / col("distance_km"), 2))
-                .otherwise(lit(None)))
+    .withColumn("is_delayed", col("lateness_minutes") > 0) \
+    .withColumn("delay_category", \
+        when(col("lateness_minutes").isNull(), "Unknown")
+        .when(col("lateness_minutes") <= 0, "On Time")
+        .when(col("lateness_minutes") <= 5, "Slight Delay")
+        .when(col("lateness_minutes") <= 15, "Moderate Delay")
+        .otherwise("Significant Delay")
+    ) \
+    .withColumn(
+        "delivery_efficiency",
+        when((col("distance_km") > 0) & col("delivery_time_minutes").isNotNull(),
+             round(col("delivery_time_minutes") / col("distance_km"), 2))
+        .otherwise(lit(None))
+    )
 
 print(f"✅ Processed delivery performance: {processed_delivery.count()} rows")
 
